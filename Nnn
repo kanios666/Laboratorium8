@@ -1,0 +1,175 @@
+import re
+import shutil
+import fitz  # PyMuPDF
+import xml.etree.ElementTree as ET
+from pathlib import Path
+from openpyxl import Workbook
+from email import policy
+from email.parser import BytesParser
+
+# 📁 Ścieżka główna
+ROOT_DIR = Path("ścieżka/do/twojego/folderu")  # <-- ZMIEŃ NA SWOJĄ ŚCIEŻKĘ
+
+# 📁 Folder docelowy na przekopiowane PDFy
+OUTPUT_DIR = Path("ścieżka/do/folderu_docelowego")  # <-- ZMIEŃ NA SWOJĄ ŚCIEŻKĘ
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+# 📄 Excel dane
+excel_data = []
+
+# 🔍 Wzorce
+PATTERNS = {
+    "faktura": r"Faktura VAT nr[:\s]*([\d]{12})",
+    "data_wystawienia": r"Data wystawienia[:\s]*([\d]{4}-[\d]{2}-[\d]{2})",
+    "termin_platnosci": r"Termin płatności[:\s]*([\d]{4}-[\d]{2}-[\d]{2})",
+    "kod_ppe": r"Kod PPE[:\s]*([A-Z0-9]{18})"
+}
+
+def extract_pdf_data(pdf_path):
+    text = ""
+    try:
+        with fitz.open(pdf_path) as doc:
+            for page in doc:
+                text += page.get_text()
+    except Exception as e:
+        print(f"Błąd czytania PDF: {pdf_path.name} -> {e}")
+        return None
+
+    data = {}
+    for key, pattern in PATTERNS.items():
+        matches = re.findall(pattern, text)
+        if matches:
+            data[key] = matches if key == "kod_ppe" else matches[0]
+        else:
+            data[key] = [] if key == "kod_ppe" else None
+    return data
+
+def extract_xml_data(xml_path):
+    try:
+        tree = ET.parse(xml_path)
+        root = tree.getroot()
+        return {
+            "client_id": root.findtext(".//ClientID"),
+            "office_number": root.findtext(".//OfficeNumber"),
+            "document_id": root.findtext(".//DocumentID")
+        }
+    except Exception as e:
+        print(f"Błąd czytania XML: {xml_path.name} -> {e}")
+        return {}
+
+def extract_eml_pdf(eml_path):
+    with open(eml_path, 'rb') as f:
+        msg = BytesParser(policy=policy.default).parse(f)
+
+    for part in msg.iter_attachments():
+        if part.get_content_type() == "application/pdf":
+            filename = part.get_filename()
+            if "Struktura_paliw" not in filename:
+                content = part.get_payload(decode=True)
+                temp_path = eml_path.parent / f"_temp_{filename}"
+                with open(temp_path, "wb") as temp_file:
+                    temp_file.write(content)
+                return temp_path
+    return None
+
+# 🔁 Przeszukiwanie folderów
+for file in ROOT_DIR.rglob("*"):
+    if file.suffix.lower() == ".pdf":
+        print(f"PDF: {file.name}")
+        pdf_data = extract_pdf_data(file)
+        if not pdf_data:
+            continue
+
+        xml_data = {}
+        for xml_file in file.parent.glob("*.xml"):
+            xml_data = extract_xml_data(xml_file)
+            break
+
+        if pdf_data["faktura"]:
+            new_name = f"{pdf_data['faktura']}.pdf"
+            try:
+                shutil.copy(file, OUTPUT_DIR / new_name)
+                status = "OK"
+            except Exception as e:
+                status = f"BŁĄD KOPIOWANIA: {e}"
+                new_name = ""
+        else:
+            status = "BRAK FAKTURY"
+            new_name = ""
+
+        row = {
+            "Faktura VAT": pdf_data["faktura"],
+            "Data wystawienia": pdf_data["data_wystawienia"],
+            "Termin płatności": pdf_data["termin_platnosci"],
+            "Kod PPE": ", ".join(pdf_data["kod_ppe"]),
+            "Client ID": xml_data.get("client_id"),
+            "Office Number": xml_data.get("office_number"),
+            "Document ID": xml_data.get("document_id"),
+            "Plik źródłowy": file.name,
+            "Plik po zmianie": new_name,
+            "Status": status
+        }
+        excel_data.append(row)
+
+    elif file.suffix.lower() == ".eml":
+        print(f"EML: {file.name}")
+        pdf_from_eml = extract_eml_pdf(file)
+        if not pdf_from_eml:
+            continue
+
+        pdf_data = extract_pdf_data(pdf_from_eml)
+        if not pdf_data:
+            continue
+
+        if pdf_data["faktura"]:
+            new_name = f"{pdf_data['faktura']}.pdf"
+            try:
+                shutil.copy(pdf_from_eml, OUTPUT_DIR / new_name)
+                status = "OK"
+            except Exception as e:
+                status = f"BŁĄD KOPIOWANIA: {e}"
+                new_name = ""
+        else:
+            status = "BRAK FAKTURY"
+            new_name = ""
+
+        row = {
+            "Faktura VAT": pdf_data["faktura"],
+            "Data wystawienia": pdf_data["data_wystawienia"],
+            "Termin płatności": pdf_data["termin_platnosci"],
+            "Kod PPE": ", ".join(pdf_data["kod_ppe"]),
+            "Client ID": None,
+            "Office Number": None,
+            "Document ID": None,
+            "Plik źródłowy": file.name,
+            "Plik po zmianie": new_name,
+            "Status": status
+        }
+        excel_data.append(row)
+
+        pdf_from_eml.unlink()  # usuń tymczasowy plik
+
+# 🧾 Eksport do Excela
+wb = Workbook()
+ws = wb.active
+ws.append([
+    "Faktura VAT", "Data wystawienia", "Termin płatności", "Kod PPE",
+    "Client ID", "Office Number", "Document ID",
+    "Plik źródłowy", "Plik po zmianie", "Status"
+])
+for row in excel_data:
+    ws.append([
+        row["Faktura VAT"],
+        row["Data wystawienia"],
+        row["Termin płatności"],
+        row["Kod PPE"],
+        row["Client ID"],
+        row["Office Number"],
+        row["Document ID"],
+        row["Plik źródłowy"],
+        row["Plik po zmianie"],
+        row["Status"]
+    ])
+wb.save("wyniki_faktur.xlsx")
+
+print("✅ Gotowe! Plik Excel stworzony, PDFy skopiowane.")
